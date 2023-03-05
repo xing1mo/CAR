@@ -105,52 +105,65 @@ class ClassAwareRegularization(tf.keras.Model):
         print(f"------ignore_label = {ignore_label}")
 
 
-
+# features：形状为 [N, H, W, C] 的特征张量，其中 N 表示批次大小，H 表示图像的高度，W 表示图像的宽度，C 表示特征通道数。
+# label：形状为 [N, H, W, 1] 的标签张量，其中每个像素对应的值表示其所属的类别。
+# extra_prefix：一个字符串，表示在损失函数名字前额外添加的前缀。
+# training：一个布尔值，表示模型当前是否处于训练模式。
     def add_car_losses(self, features, label=None, extra_prefix=None, training=None):
 
         # features : [N, H, W, C]
 
         training = get_training_value(training)
 
+# loss_name_prefix 表示损失函数的名字前缀，extra_prefix 是一个可选参数，用于在损失函数名字前额外添加前缀。
         loss_name_prefix = f"{self.name}"
 
         if extra_prefix is not None:
             loss_name_prefix = f"{loss_name_prefix}_{extra_prefix}"
 
+#inputs_shape 变量表示 features 的形状，height 和 width 变量表示图像的高度和宽度
         inputs_shape = tf.shape(features)
         height = inputs_shape[-3]
         width = inputs_shape[-2]
 
+#对标签进行了处理，将其缩放到与特征张量相同的大小，并进行了一些检查，确保特征张量中不包含 nan 或 inf。
         label = resize_image(label, (height, width), method="nearest")
 
         tf.debugging.check_numerics(features, "features contains nan or inf")
 
+#将特征张量展平成二维数组
         flatten_features = flatten_hw(features)
 
+#创建了一个掩码，表示哪些像素不应该被忽略
         not_ignore_spatial_mask = tf.cast(label, tf.int32) != self.ignore_label  # [N, H, W, 1]
         not_ignore_spatial_mask = flatten_hw(not_ignore_spatial_mask)
 
+#one_hot_label 是一个二维张量，其中每一行表示一个像素的类别独热编码
         one_hot_label = get_flatten_one_hot_label(
             label, num_class=self.num_class, ignore_label=self.ignore_label
         )  # [N, HW, class]
 
         ####################################################################################
 
+#class_sum_features为真值类中心(每个类别特征值的总和），class_sum_features为非零元素数量
         class_sum_features, class_sum_non_zero_map = get_class_sum_features_and_counts(
             flatten_features, one_hot_label
         )  # [N, class, C]
 
+#为了减轻噪声图像的负面影响，我们使用批处理(a batch)的所有训练图像计算类中心
         if self.use_batch_class_center:
 
+            #获取replica_context，如果replica_context存在，则表示处于分布式环境下，需要对计算结果进行全局合并
             replica_context = tf.distribute.get_replica_context()
 
+            #对不同batch进行求和
             class_sum_features_in_cross_batch = tf.reduce_sum(
                 class_sum_features, axis=0, keepdims=True, name="class_sum_features_in_cross_batch"
             )
             class_sum_non_zero_map_in_cross_batch = tf.reduce_sum(
                 class_sum_non_zero_map, axis=0, keepdims=True, name="class_sum_non_zero_map_in_cross_batch"
             )
-
+            #如果处于分布式环境下，进行全局合并
             if replica_context:
                 class_sum_features_in_cross_batch = replica_context.all_reduce(
                     tf.distribute.ReduceOp.SUM, class_sum_features_in_cross_batch
@@ -159,17 +172,21 @@ class ClassAwareRegularization(tf.keras.Model):
                     tf.distribute.ReduceOp.SUM, class_sum_non_zero_map_in_cross_batch
                 )
 
+            #如公式1，除上非零数量
             class_avg_features_in_cross_batch = tf.math.divide_no_nan(
                 class_sum_features_in_cross_batch, class_sum_non_zero_map_in_cross_batch
             )  # [1, class, C]
 
-            if self.use_last_class_center:
-
+            if self.use_last_class_center:#是否需要考虑上次迭代得到的类中心
+                #通过比较class_sum_non_zero_map_in_cross_batch和零得到一个布尔掩码,用于指示哪些类别在此batch中出现过
                 batch_class_ignore_mask = tf.cast(class_sum_non_zero_map_in_cross_batch != 0, tf.int32)
                 
+                #将class_avg_features_in_cross_batch和self.last_class_center相减，得到每个类别特征向量的差异
                 class_center_diff = class_avg_features_in_cross_batch - tf.cast(self.last_class_center, class_avg_features_in_cross_batch.dtype)
+                #提取class_center_diff中所有存在的类别乘上系数last_class_center_decay，得到需要保留的diff
                 class_center_diff *= (1 - self.last_class_center_decay) * tf.cast(batch_class_ignore_mask, class_center_diff.dtype)
 
+                #计算出本次迭代的last_class_center
                 self.last_class_center.assign_add(class_center_diff)
 
                 class_avg_features_in_cross_batch = tf.cast(self.last_class_center, tf.float32)
@@ -183,24 +200,24 @@ class ClassAwareRegularization(tf.keras.Model):
 
         ####################################################################################
 
-        if self.use_inter_class_loss and training:
+        if self.use_inter_class_loss and training:#计算类间loss
 
             inter_class_relative_loss = 0
 
             if self.use_inter_c2c_loss:
-                inter_class_relative_loss += get_inter_class_relative_loss(
+                inter_class_relative_loss += get_inter_class_relative_loss(#最大化类中心之间的距离
                     class_avg_features, inter_c2c_loss_threshold=self.inter_c2c_loss_threshold,
                 )
 
             if self.use_inter_c2p_loss:
-                inter_class_relative_loss += get_pixel_inter_class_relative_loss(
+                inter_class_relative_loss += get_pixel_inter_class_relative_loss(#最大化类中心与不属于该类的任何像素之间的距离
                     flatten_features, class_avg_features, one_hot_label, inter_c2p_loss_threshold=self.inter_c2p_loss_threshold,
                 )
 
             self.add_loss(inter_class_relative_loss * self.inter_class_loss_rate)
             self.add_metric(inter_class_relative_loss, name=f"{loss_name_prefix}_orl")
 
-        if self.use_intra_class_loss:
+        if self.use_intra_class_loss:#计算类内loss
 
             same_avg_value = tf.matmul(one_hot_label, class_avg_features)
 
@@ -254,11 +271,11 @@ class ClassAwareRegularization(tf.keras.Model):
         # to the next one (end_conv) during inference
         # Simple (x * w0 + b) * w1 dot product
         # We keep it for better understanding
-        x = self.linear_conv(x) 
+        x = self.linear_conv(x) #一个conv
 
-        y = tf.identity(x)
+        y = tf.identity(x)#把任意输入强制转换成 Tensor
 
-        if self.train_mode and get_training_value(training):
+        if self.train_mode and get_training_value(training):#训练模式直接监督
 
             x = tf.cast(x, tf.float32)
 
@@ -274,7 +291,7 @@ class ClassAwareRegularization(tf.keras.Model):
 
                 if pooling_rate > 1:
                     stride_size = (1, pooling_rate, pooling_rate, 1)
-                    sub_x = tf.nn.avg_pool2d(sub_x, stride_size, stride_size, padding="SAME")
+                    sub_x = tf.nn.avg_pool2d(sub_x, stride_size, stride_size, padding="SAME")#平均池化
 
                 self.add_car_losses(sub_x, label=label, extra_prefix=str(pooling_rate), training=training)
 

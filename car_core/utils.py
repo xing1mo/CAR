@@ -34,14 +34,15 @@ def get_class_sum_features_and_counts(features, one_hot_label):
 
     # features [N, HW, C]
     # label [N, HW, class] int
-
+#首先将one_hot_label沿着第2个和第3个维度进行转置，以便class_mask具有形状[N, class, HW]。
     class_mask = tf.transpose(one_hot_label, [0, 2, 1])  # [N, class, HW]
 
+#使用tf.math.count_nonzero函数沿着最后一个维度（即HW）计算每个标签类别的非零元素数量，结果形状为[N, class, 1]
     non_zero_map = tf.math.count_nonzero(class_mask, axis=-1, keepdims=True, dtype=tf.int32)
     non_zero_map = tf.cast(non_zero_map, dtype=features.dtype)  # [N, class, 1]
 
     class_mask = tf.cast(class_mask, dtype=features.dtype)
-
+#将class_mask和features进行矩阵乘法运算，以得真值类中心，结果形状为[N, class, C]
     class_sum_feature = tf.matmul(class_mask, features)  # [N, class, C]
 
     return class_sum_feature, non_zero_map
